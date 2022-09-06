@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+
+import argparse
+import upnpclient
+import json
+import xmltodict
+import datetime
+import requests
+import os, sys
+import re
+import textwrap as tr 
+from configparser import ConfigParser
+from pydoc import pager
+from simple_term_menu import TerminalMenu
+
+def get_nowplaying():
+
+    dev = conf["dev"]
+    ret = dev.AVTransport.GetMediaInfo(InstanceID=0)
+    meta = ret["CurrentURIMetaData"]
+    track = xmltodict.parse(meta)["DIDL-Lite"]["item"]
+
+    print(f'{track["upnp:artist"]} - {track["upnp:album"]}: {track["dc:title"]}')
+    
+
+def do_play(query):
+
+    dev = conf["dev"]
+    url = f'https://api.tidal.com/v1/search/albums?countryCode={conf["country_code"]}&query={query}'
+    ret = requests.get(url=url,headers=conf["headers"]).json()
+    albums = ret["items"]
+
+    album_id=albums[0]["id"]
+    title=albums[0]["title"]
+    list_name=title.replace('&','&amp;')
+
+    xml = f'<?xml version="1.0"?><PlayList><ListName>{list_name}</ListName><ListInfo><SourceName>Tidal</SourceName><SearchUrl>https://api.tidal.com/v1/albums/{album_id}/tracks?countryCode={conf["country_code"]}&amp;offset=0&amp;limit=50</SearchUrl> <requestQuality>LOSSLESS</requestQuality></ListInfo></PlayList>'
+
+    #### Stop the WiiM Mini
+    dev.AVTransport.Stop(InstanceID='0')
+
+    #### Populate the WiiM Queue
+    dev.PlayQueue.CreateQueue(QueueContext=xml) 
+
+    #### Play
+    dev.PlayQueue.PlayQueueWithIndex(QueueName=list_name,Index=0)
+
+    print("Playing",title)
+
+def from_title(meta):
+    global conf
+    list = meta.split("~")
+    txt = "    ".join(list[2:])
+    
+    review = get_text(node="review",album_id=list[0])
+    
+    return(txt + "\n\n" + review)
+ 
+    
+
+def do_search(query):
+
+    dev=conf['dev']
+    url = f'https://api.tidal.com/v1/search/albums?countryCode={conf["country_code"]}&query={query}&limit=100'
+    ret = requests.get(url=url,headers=conf["headers"]).json()
+    albums = ret["items"]
+    options=[]
+    idx=1
+    for album in albums:
+        preview=[str(album["id"]),str(album["artist"]["id"]),f'Tracks: {album["numberOfTracks"]}',f'Released: {album["releaseDate"]}', f'Quality: {album["audioQuality"]}']
+        preview="~".join(preview)
+        
+        option = f'{idx} {album["artist"]["name"]} - {album["title"]}|{preview}'
+        options.append(option)
+        idx = idx+1
+        
+        
+    terminal_menu = TerminalMenu(options,
+                                 clear_screen=True,
+                                 title="Enter:Play Esc:Exit", 
+                                 preview_command=from_title,
+                                 preview_size=0.5)
+                                 
+    menu_entry_index = terminal_menu.show()
+    if menu_entry_index == None:
+        return
+    else:
+        list_name=albums[menu_entry_index]["title"].replace("&","&amp;")
+        album_id=albums[menu_entry_index]["id"]
+        
+        xml = f'<?xml version="1.0"?><PlayList><ListName>{list_name}</ListName><ListInfo><SourceName>Tidal</SourceName><SearchUrl>https://api.tidal.com/v1/albums/{album_id}/tracks?countryCode={conf["country_code"]}&amp;offset=0&amp;limit=50</SearchUrl> <requestQuality>LOSSLESS</requestQuality></ListInfo></PlayList>'
+
+        #### Stop the WiiM Mini
+        dev.AVTransport.Stop(InstanceID='0')
+
+        #### Populate the WiiM Queue
+        dev.PlayQueue.CreateQueue(QueueContext=xml) 
+
+        #### Play
+        dev.PlayQueue.PlayQueueWithIndex(QueueName=list_name,Index=0)
+
+        print("Playing:",albums[menu_entry_index]["artist"]["name"],"-",albums[menu_entry_index]["title"])
+
+def get_text(node="",album_id=0,artist_id=0):
+
+    if album_id==0 and artist_id==0:
+        dev = conf["dev"]
+        obj = dev.AVTransport.GetMediaInfo(InstanceID='0')
+        meta = obj['CurrentURIMetaData']
+
+        track = json.dumps(meta).split('<song:id>')[1]
+        track_id = track.split('</song:id>')[0]
+
+        try:
+            url= f'https://api.tidal.com/v1/tracks/{track_id}?countryCode={conf["country_code"]}'
+            ret = requests.get(url,headers=conf["headers"]).json()
+
+            album_id = ret['album']['id']
+            artist_id = ret['artist']['id']
+        except:
+            return("")
+        
+    try:
+        if node == "review":
+            url= f'https://api.tidal.com/v1/albums/{album_id}/review?countryCode={conf["country_code"]}'
+        elif node == "bio":
+            url= f'https://api.tidal.com/v1/artists/{artist_id}/bio?countryCode={conf["country_code"]}'
+        else:
+            return("")
+        
+        ret = requests.get(url,headers=conf["headers"]).json()
+        text = ret['text']
+        text = re.sub("[\[].*?[\]]", "", text)
+        lines = tr.wrap(text,width=conf["columns"]-5)
+        text='\n'.join(lines)
+        text = text.replace("<br/>","\n\n")
+        return(text)
+    except:
+        return("")
+
+def main():
+    global conf
+    
+    home_dir = os.path.expanduser('~')
+    config_file = os.path.join(home_dir,'.config/wiim/wiim.ini')
+    config = ConfigParser()
+    config.read(config_file)
+
+    conf = {}
+    conf['country_code']=config['TIDAL']['country_code']
+    conf['client_id']=config['TIDAL']['client_id']
+    conf['description_url'] = config['WIIM']['description_url'] 
+    conf['headers'] = {"x-tidal-token":conf["client_id"]}
+    conf['dev'] = upnpclient.Device(conf["description_url"])
+    size = os.get_terminal_size()
+    conf['columns'] = size.columns
+    conf['lines'] = size.lines
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-b','--bio',type=str,nargs='*',help='Display artist bio')
+    parser.add_argument('-r','--review',type=str,nargs='*',help='Display album review')
+    parser.add_argument('-p','--play',type=str,nargs='+',help='Search for and play album')
+    parser.add_argument('-s','--search',type=str,nargs='+',help='Search for album')
+
+    args = parser.parse_args()
+
+    if args.bio != None:
+        text = get_text("bio")
+        if text != "":
+            pager(text)
+
+            
+    elif args.review != None:
+        text = get_text("review")
+        if text != "":
+            pager(text)
+
+    elif args.search != None:
+        do_search(' '.join(args.search))
+    
+    elif args.play != None:
+        if len(args.play) <3:
+            print('Minimum of three search terms required (artist [first] [last] album [name])')
+        else:
+            do_play(' '.join(args.play))
+    
+    else:
+        get_nowplaying()
+
+if __name__ == "__main__":
+    main()
+    
